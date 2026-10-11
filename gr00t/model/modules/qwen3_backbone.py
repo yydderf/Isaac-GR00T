@@ -19,6 +19,8 @@ from huggingface_hub.errors import GatedRepoError
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
+from gr00t.utils.nvtx import nvtx_phase
+
 
 logger = logging.getLogger(__name__)
 
@@ -359,10 +361,12 @@ class Qwen3Backbone(torch.nn.Module):
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
-        outputs = outputs.hidden_states[-1]
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
-        attention_mask = vl_input["attention_mask"] == 1
+        with nvtx_phase("backbone.vlm"):
+            outputs = self.model(**vl_input, output_hidden_states=True)
+            outputs = outputs.hidden_states[-1]
+        with nvtx_phase("backbone.masks"):
+            image_mask = vl_input["input_ids"] == self.model.config.image_token_id
+            attention_mask = vl_input["attention_mask"] == 1
         return BatchFeature(
             data={
                 "backbone_features": outputs,

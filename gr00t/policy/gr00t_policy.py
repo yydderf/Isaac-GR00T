@@ -30,6 +30,7 @@ from transformers import AutoModel, AutoProcessor
 from gr00t.data.embodiment_tags import FINETUNE_ONLY_TAGS, POSTTRAIN_TAGS, EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
+from gr00t.utils.nvtx import nsys_profile, nvtx_phase
 
 from .policy import BasePolicy, PolicyWrapper
 
@@ -377,6 +378,7 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
+    @nsys_profile
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -397,38 +399,47 @@ class Gr00tPolicy(BasePolicy):
             Tuple of (actions_dict, info_dict)
         """
         # Step 1: Split batched observation into individual observations
-        unbatched_observations = self._unbatch_observation(observation)
+        with nvtx_phase("prep.unbatch"):
+            unbatched_observations = self._unbatch_observation(observation)
         processed_inputs = []
 
         # Step 2: Process each observation through the VLA processor
+        # CPU-bound (image resize, tokenization); reads as GPU-idle on the timeline.
         states = []
-        for obs in unbatched_observations:
-            vla_step_data = self._to_vla_step_data(obs)
-            states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
-            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
-            processed_inputs.append(self.processor(messages))
+        with nvtx_phase("prep.processor"):
+            for obs in unbatched_observations:
+                vla_step_data = self._to_vla_step_data(obs)
+                states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
+                messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+                processed_inputs.append(self.processor(messages))
 
         # Step 3: Collate processed inputs into a single batch for model
-        collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        with nvtx_phase("prep.collate"):
+            collated_inputs = self.collate_fn(processed_inputs)
+            collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
+        with nvtx_phase("infer.model"), torch.inference_mode():
             model_pred = self.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
-        batched_states = {}
-        for k in self.modality_configs["state"].modality_keys:
-            batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
-        unnormalized_action = self.processor.decode_action(
-            normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
-        )
+        # The .cpu() below is a device->host sync: it reads as a GPU gap, but the
+        # cost is the transfer plus everything still queued behind it.
+        with nvtx_phase("post.decode_action"):
+            batched_states = {}
+            for k in self.modality_configs["state"].modality_keys:
+                batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
+            with nvtx_phase("post.d2h"):
+                normalized_action_np = normalized_action.cpu().numpy()
+            unnormalized_action = self.processor.decode_action(
+                normalized_action_np, self.embodiment_tag, batched_states
+            )
 
-        # Cast all actions to float32 for consistency
-        casted_action = {
-            key: value.astype(np.float32) for key, value in unnormalized_action.items()
-        }
+            # Cast all actions to float32 for consistency
+            casted_action = {
+                key: value.astype(np.float32) for key, value in unnormalized_action.items()
+            }
         return casted_action, {}
 
     def check_action(self, action: dict[str, Any]) -> None:

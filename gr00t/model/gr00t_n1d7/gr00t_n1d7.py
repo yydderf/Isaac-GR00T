@@ -30,6 +30,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.utils.nvtx import nvtx_phase
 
 
 logger = logging.getLogger(__name__)
@@ -394,45 +395,57 @@ class Gr00tN1d7ActionHead(nn.Module):
             ] = ramp[None, :, None].to(device)
 
         # Run denoising steps.
+        # One constant range name per phase (not per step index) so nsys aggregates
+        # the N iterations into comparable statistics.
         for t in range(self.num_inference_timesteps):
-            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
+            with nvtx_phase("step"):
+                t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
+                t_discretized = int(t_cont * self.num_timestep_buckets)
 
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
+                with nvtx_phase("step.action_encoder"):
+                    # Embed noised action trajectory.
+                    timesteps_tensor = torch.full(
+                        size=(batch_size,), fill_value=t_discretized, device=device
+                    )
+                    action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+                    # Add position embedding.
+                    if self.config.add_pos_embed:
+                        pos_ids = torch.arange(
+                            action_features.shape[1], dtype=torch.long, device=device
+                        )
+                        pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+                        action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+                    # Join vision, language, state and action embedding along sequence dimension.
+                    sa_embs = torch.cat((state_features, action_features), dim=1)
 
-            # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
-                )
-            else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                )
-            pred = self.action_decoder(model_output, embodiment_id)
+                # Run model forward.
+                # NOTE: self.model is the one torch.compile boundary in this repo
+                # (benchmark_inference.py wraps its forward in max-autotune). The range
+                # wraps the eager call site only -- do not push NVTX inside the DiT.
+                with nvtx_phase("step.dit"):
+                    if self.config.use_alternate_vl_dit:
+                        model_output = self.model(
+                            hidden_states=sa_embs,
+                            encoder_hidden_states=vl_embeds,
+                            timestep=timesteps_tensor,
+                            image_mask=backbone_output.image_mask,
+                            backbone_attention_mask=backbone_output.backbone_attention_mask,
+                        )
+                    else:
+                        model_output = self.model(
+                            hidden_states=sa_embs,
+                            encoder_hidden_states=vl_embeds,
+                            timestep=timesteps_tensor,
+                        )
 
-            pred_velocity = pred[:, -self.action_horizon :]
+                with nvtx_phase("step.action_decoder"):
+                    pred = self.action_decoder(model_output, embodiment_id)
 
-            # Update actions using euler integration.
-            actions = actions + dt * pred_velocity * vel_strength
+                    pred_velocity = pred[:, -self.action_horizon :]
+
+                    # Update actions using euler integration.
+                    actions = actions + dt * pred_velocity * vel_strength
 
         return BatchFeature(
             data={
@@ -464,7 +477,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             BatchFeature containing:
                 - action_pred: [B, action_horizon, action_dim] predicted actions
         """
-        features = self._encode_features(backbone_output, action_input)
+        with nvtx_phase("head.encode_features"):
+            features = self._encode_features(backbone_output, action_input)
         return self.get_action_with_features(
             backbone_features=features.backbone_features,
             state_features=features.state_features,
@@ -604,12 +618,15 @@ class Gr00tN1d7(PreTrainedModel):
         """
         Generate actions using the complete model.
         """
-        # Prepare inputs for backbone and action head
-        backbone_inputs, action_inputs = self.prepare_input(inputs)
+        # Prepare inputs for backbone and action head (host->device transfer + dtype cast)
+        with nvtx_phase("fwd.prepare_input.h2d"):
+            backbone_inputs, action_inputs = self.prepare_input(inputs)
 
         # Forward through backbone
-        backbone_outputs = self.backbone(backbone_inputs)
-        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        with nvtx_phase("fwd.backbone"):
+            backbone_outputs = self.backbone(backbone_inputs)
+        with nvtx_phase("fwd.action_head"):
+            action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
 
         return action_outputs
 

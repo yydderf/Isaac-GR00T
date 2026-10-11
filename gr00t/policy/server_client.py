@@ -26,6 +26,7 @@ import zmq
 
 from gr00t.data.types import ModalityConfig
 from gr00t.data.utils import to_json_serializable
+from gr00t.utils.nvtx import nvtx_phase
 
 from .policy import BasePolicy
 
@@ -244,7 +245,8 @@ class PolicyServer:
         while self.running:
             try:
                 message = self.socket.recv()
-                request = MsgSerializer.from_bytes(message)
+                with nvtx_phase("req.deserialize"):
+                    request = MsgSerializer.from_bytes(message)
 
                 # Validate token before processing request
                 if not self._validate_token(request):
@@ -259,12 +261,15 @@ class PolicyServer:
                     raise ValueError(f"Unknown endpoint: {endpoint}")
 
                 handler = self._endpoints[endpoint]
-                result = (
-                    handler.handler(**request.get("data", {}))
-                    if handler.requires_input
-                    else handler.handler()
-                )
-                self.socket.send(MsgSerializer.to_bytes(result))
+                with nvtx_phase(f"req.handler[{endpoint}]"):
+                    result = (
+                        handler.handler(**request.get("data", {}))
+                        if handler.requires_input
+                        else handler.handler()
+                    )
+                with nvtx_phase("req.serialize"):
+                    payload = MsgSerializer.to_bytes(result)
+                self.socket.send(payload)
             except Exception as e:
                 print(f"Error in server: {e}")
                 import traceback
